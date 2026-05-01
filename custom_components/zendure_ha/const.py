@@ -40,6 +40,7 @@ class ManagerMode(Enum):
     MATCHING = 2
     MATCHING_DISCHARGE = 3
     MATCHING_CHARGE = 4
+    MATCHING_CHARGE_BAT = 5
 
 
 class ManagerState(Enum):
@@ -68,5 +69,5 @@ class SmartMode:
 
     HEMSOFF_TIMEOUT = 60  # Seconds before HEMS state is set to OFF if no updates are received
 
-    POWER_START = 50  # Minimum Power (W) for starting a device
+    POWER_START = 25  # Minimum Power (W) for starting a device
     POWER_TOLERANCE = 5  # Device-level power tolerance (W) before updating

@@ -127,6 +127,7 @@ class ZendureDevice(EntityDevice):
         self.batteryInput = ZendureSensor(self, "outputPackPower", None, "W", "power", "measurement")
         self.batteryOutput = ZendureSensor(self, "packInputPower", None, "W", "power", "measurement")
         self.homeOutput = ZendureSensor(self, "outputHomePower", None, "W", "power", "measurement")
+        self.commandedPwr = ZendureSensor(self, "commandedPwr", None, "W", "power", "measurement") #HarryAddition
         self.heatState = ZendureBinarySensor(self, "heatState")
         self.hemsState = ZendureBinarySensor(self, "hemsState")
         self.hemsStateUpdate = datetime.min
@@ -208,7 +209,7 @@ class ZendureDevice(EntityDevice):
                     case "gridInputPower":
                         self.aggrHomeInput.aggregate(dt_util.now(), value)
                         _LOGGER.info(f"value for gridInputPower {self.homeInput.asInt}W as float {self.homeInput.asNumber}W")
-                    case "outputHomePower":
+                    case "outputHomePower" | "acOutputPower":
                         self.aggrHomeOut.aggregate(dt_util.now(), value)
                     case "gridOffPower":
                         self.aggrOffGrid.aggregate(dt_util.now(), value)
@@ -481,6 +482,7 @@ class ZendureDevice(EntityDevice):
     async def power_charge(self, power: int) -> int:
         """Set charge power."""
         power = min(0, max(power, self.charge_limit))
+        self.commandedPwr.update_value(abs(power))
         if abs(power - self.homeInput.asInt + self.homeOutput.asInt) <= SmartMode.POWER_TOLERANCE:
             _LOGGER.info(f"Power charge {self.name} => no action [power {power}]")
             return self.homeInput.asInt
@@ -493,6 +495,7 @@ class ZendureDevice(EntityDevice):
     async def power_discharge(self, power: int) -> int:
         """Set discharge power."""
         power = max(0, min(power, self.discharge_limit))
+        self.commandedPwr.update_value(abs(power))
         if abs(power - self.homeOutput.asInt + self.homeInput.asInt) <= SmartMode.POWER_TOLERANCE:
             _LOGGER.info(f"Power discharge {self.name} => no action [power {power}]")
             return self.homeOutput.asInt
@@ -500,6 +503,7 @@ class ZendureDevice(EntityDevice):
 
     async def power_off(self) -> None:
         """Set the power off."""
+        self.commandedPwr.update_value(0)
 
     @property
     def online(self) -> bool:
