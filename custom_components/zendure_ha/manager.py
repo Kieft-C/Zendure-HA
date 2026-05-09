@@ -65,7 +65,7 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
         self.zero_fast = datetime.min
         self.check_reset = datetime.min
         self.p1meterEvent: Callable[[], None] | None = None
-        self.p1_history: deque[int] = deque([25, -25], maxlen=8)
+        self.p1_history: deque[int] = deque([25, -25], maxlen=4)
         self.p1_factor = 1
         self.update_count = 0
 
