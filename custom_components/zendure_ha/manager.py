@@ -515,7 +515,7 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
         # prevent hysteria
         if self.charge_time > time:
             if self.charge_time == datetime.max:
-                self.charge_time = time + timedelta(seconds=2 if (time - self.charge_last).total_seconds() > 300 else 60)
+                self.charge_time = time + timedelta(seconds=2 if (time - self.charge_last).total_seconds() > 300 else 10) #war vorher 60
                 self.charge_last = self.charge_time
                 self.pwr_low = 0
             setpoint = 0
