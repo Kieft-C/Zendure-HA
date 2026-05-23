@@ -7,6 +7,8 @@ import hashlib
 import json
 import logging
 import traceback
+import re
+import aiohttp
 from collections import deque
 from collections.abc import Callable
 from datetime import datetime, timedelta
@@ -20,7 +22,7 @@ from homeassistant.components import bluetooth, persistent_notification
 from homeassistant.components.number import NumberMode
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import Event, EventStateChangedData, HomeAssistant, callback
-from homeassistant.helpers.event import async_track_state_change_event
+from homeassistant.helpers.event import async_track_state_change_event, async_track_state_change, async_track_time_interval
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.loader import async_get_integration
 
@@ -34,6 +36,7 @@ from .select import ZendureRestoreSelect, ZendureSelect
 from .sensor import ZendureSensor
 
 SCAN_INTERVAL = timedelta(seconds=60)
+ENDPOINTS = ["/status", "/properties/report", "/rpc/Shelly.GetStatus"]
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -57,10 +60,14 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
         self.zero_fast = datetime.min
         self.check_reset = datetime.min
         self.p1meterEvent: Callable[[], None] | None = None
-        self.p1_history: deque[int] = deque([25, -25], maxlen=8)
+        self.p1_history: deque[int] = deque([25, -25], maxlen=4) #vorher maxlen=8
         self.p1_factor = 1
         self.update_count = 0
-
+        self._p1_last_value = None
+        self._p1_pending_value = None
+        self._p1_pending_since = None
+        self._p1_peak_filter_duration = timedelta(seconds=3)
+        
         self.charge: list[ZendureDevice] = []
         self.charge_limit = 0
         self.charge_optimal = 0
@@ -94,11 +101,12 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
             return
         self.attr_device_info["sw_version"] = integration.manifest.get("version", "unknown")
 
-        self.operationmode = (ZendureRestoreSelect(self, "Operation", {0: "off", 1: "manual", 2: "smart", 3: "smart_discharging", 4: "smart_charging"}, self.update_operation),)
+        self.operationmode = (ZendureRestoreSelect(self, "Operation", {0: "off", 1: "manual", 2: "smart", 3: "smart_discharging", 4: "smart_charging", 5: "smart_charging_bat"}, self.update_operation),)
         self.operationstate = ZendureSensor(self, "operation_state")
         self.manualpower = ZendureRestoreNumber(self, "manual_power", None, None, "W", "power", 12000, -12000, NumberMode.BOX, True)
         self.availableKwh = ZendureSensor(self, "available_kwh", None, "kWh", "energy", None, 1)
         self.power = ZendureSensor(self, "power", None, "W", "power", "measurement", 0)
+        self.p1meter = ZendureSensor(self, "p1Meter", None, "W", "power", "measurement", 0)
 
         # load devices
         for dev in data["deviceList"]:
@@ -142,14 +150,24 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
 
         self.devices = list(Api.devices.values())
         _LOGGER.info(f"Loaded {len(self.devices)} devices")
+        if len(self.devices) > 1:
+            self.optimialPower = ZendureRestoreNumber(self, "optimalPower", self.update_optimal, None, "%", None, 100, 10, NumberMode.SLIDER, True)
+            if self.optimialPower.asNumber == 0:
+                self.optimialPower.update_value(25)
 
         # initialize the api & p1 meter
         await EntityDevice.add_entities()
         self.api.Init(self.config_entry.data, mqtt)
-        self.update_p1meter(self.config_entry.data.get(CONF_P1METER, "sensor.power_actual"))
+        await self.update_p1meter(self.config_entry.data.get(CONF_P1METER, "sensor.power_actual"))
         await asyncio.sleep(1)  # allow other tasks to run
         await self.update_fusegroups()
         Api.mqttLogging = True
+
+    async def update_optimal(self, entity: ZendureRestoreNumber, _operation: Any) -> None:
+        for d in self.devices:
+            d.charge_optimal = int(d.charge_limit // 100 * self.optimialPower.asNumber) if self.optimialPower is not None else d.charge_limit // 4
+            d.discharge_optimal = int(d.discharge_limit // 100 * self.optimialPower.asNumber) if self.optimialPower is not None else d.discharge_limit // 4
+
 
     async def update_fusegroups(self) -> None:
         _LOGGER.info("Update fusegroups")
@@ -286,17 +304,159 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
         if self.hass and self.hass.loop.is_running():
             self._schedule_refresh()
 
-    def update_p1meter(self, p1meter: str | None) -> None:
+    async def fetch_power_value(self, hass, ip: str, endpoint: str):
+        async with aiohttp.ClientSession() as session:
+            try:
+                async with session.get(f"http://{ip}{endpoint}") as resp:
+                    try:
+                        data = await resp.json()
+                    except Exception:
+                        data = await resp.text()
+                        data = json.loads(data)
+                    return self.parse_power(data)
+            except Exception as e:
+                _LOGGER.warning(f"Fetch error from {ip}{endpoint}: {e}")
+                return None
+
+    def parse_power(self, data: dict):
+        # --- Generische Suche ---
+        # --- Shelly 3EM / Zendure 3CT ---
+        if "total_power" in data:
+            return float(data["total_power"])
+        # --- Shelly 3EM Pro ---
+        if "total_act_power" in data["em:0"]:
+            return float(data["em:0"]["total_act_power"])
+        for k, v in data.items():
+            if "total" in k and "power" in k:
+                return float(v)
+
+    async def update_p1meter(self, p1meter: str | None) -> None:
         """Update the P1 meter sensor."""
         _LOGGER.debug("Updating P1 meter to: %s", p1meter)
-        if self.p1meterEvent:
-            self.p1meterEvent()
+
+        interval = SmartMode.P1_HTTP_UPDATE
+
+        if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", p1meter) is not None:
+            # Endpunkt einmalig bestimmen
+            endpoint = await self.detect_endpoint(p1meter)
+            if not endpoint:
+                _LOGGER.error(f"No valid endpoint found for {p1meter}")
+                return
+
+            async def poll_http(now):
+                value = await self.fetch_power_value(self.hass, p1meter, endpoint)
+                if value is not None:
+                    self.p1meter.update_value(value)
+
+            async_track_time_interval(self.hass, poll_http, timedelta(seconds=interval))
+        else:
+            async def sensor_changed(entity_id, old_state, new_state):
+                if new_state and new_state.state not in (None, "", "unknown", "unavailable"):
+                    try:
+                        value = float(new_state.state)
+                        self.p1meter.update_value(value)
+                    except ValueError:
+                        pass
+
+            async def _sensor_changed_event_wrapper(event):
+                """Wrapper für async_track_state_change_event: extrahiert old/new state."""
+                data = event.data
+                entity_id = data.get("entity_id")
+                old_state = data.get("old_state")
+                new_state = data.get("new_state")
+
+                await sensor_changed(entity_id, old_state, new_state)
+
+            async_track_state_change_event(self.hass, p1meter, _sensor_changed_event_wrapper)
+
+        # alte Listener deregistrieren 
+        if self.p1meterEvent: 
+            for unsub in self.p1meterEvent: 
+                unsub()
         if p1meter:
-            self.p1meterEvent = async_track_state_change_event(self.hass, [p1meter], self._p1_changed)
+            self.p1meterEvent = [
+                async_track_state_change_event(
+                    self.hass,
+                    [p1meter],
+                    self._p1_event_wrapper
+                ),            
+                async_track_state_change_event(
+                    self.hass,
+                    [self.p1meter.entity_id],
+                    self._p1_event_wrapper
+                )
+            ]                
             if (entity := self.hass.states.get(p1meter)) is not None and entity.attributes.get("unit_of_measurement", "W") in ("kW", "kilowatt", "kilowatts"):
                 self.p1_factor = 1000
         else:
             self.p1meterEvent = None
+
+    async def detect_endpoint(self, ip: str) -> str | None:
+        async with aiohttp.ClientSession() as session:
+            for endpoint in ENDPOINTS:
+                try:
+                    async with session.get(f"http://{ip}{endpoint}") as resp:
+                        if resp.status == 200:
+                            return endpoint
+                except Exception as e:
+                    _LOGGER.warning(f"Fetch error from {ip}{endpoint}: {e}")
+                    continue
+        return None
+
+    async def _p1_event_wrapper(self, event):
+        """Wrapper für async_track_state_change_event: extrahiert old/new state."""
+        data = event.data
+        entity_id = data.get("entity_id")
+        old_state = data.get("old_state")
+        new_state = data.get("new_state")
+
+        await self._p1_changed_filtered(entity_id, old_state, new_state)
+
+    
+    async def _p1_changed_filtered(self, entity_id, old_state, new_state):
+        """Filtert 2s-Peaks heraus, bevor _p1_changed aufgerufen wird."""
+
+        if not new_state or new_state.state in (None, "", "unknown", "unavailable"):
+            return
+
+        try:
+            value = float(new_state.state)
+        except ValueError:
+            return
+
+        now = datetime.now()
+
+        # Erster Wert → direkt übernehmen
+        if self._p1_last_value is None:
+            self._p1_last_value = value
+            await self._p1_changed(entity_id, old_state, new_state)
+            return
+
+        # Wenn Wert nahe am letzten Wert → kein Peak
+        if abs(value - self._p1_last_value) < 100:
+            self._p1_last_value = value
+            await self._p1_changed(entity_id, old_state, new_state)
+            self._p1_pending_value = None
+            return
+
+        # Wert unterscheidet sich deutlich → könnte Peak sein
+        if self._p1_pending_value is None:
+            # Peak-Kandidat merken
+            _LOGGER.info(f"Peak detected {value}W")
+            self._p1_pending_value = value
+            self._p1_pending_since = now
+            return
+
+        # Prüfen, ob der Peak 2 Sekunden stabil blieb
+        if now - self._p1_pending_since >= self._p1_peak_filter_duration:
+            # Peak ist echt → weitergeben
+            self._p1_last_value = self._p1_pending_value
+            await self._p1_changed(entity_id, old_state, new_state)
+            self._p1_pending_value = None
+            self._p1_pending_since = None
+        else:
+            # Peak noch nicht bestätigt → nichts tun
+            return
 
     def writeSimulation(self, time: datetime, p1: int) -> None:
         if Path("simulation.csv").exists() is False:
@@ -341,12 +501,16 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
             f.write(f"{time};{p1};{self.operation};{tbattery};{tsolar};{thome};{self.manualpower.asNumber};" + data + "\n")
 
     @callback
-    async def _p1_changed(self, event: Event[EventStateChangedData]) -> None:
+    async def _p1_changed(self, entity_id, old_state, new_state) -> None:
         # update new entities
         await EntityDevice.add_entities()
 
         # exit if there is nothing to do
-        if not self.hass.is_running or not self.hass.is_running or (new_state := event.data["new_state"]) is None:
+        if (
+            not self.hass.is_running
+            or new_state is None
+            or new_state.state in (None, "", "unknown", "unavailable")
+        ):
             return
 
         try:  # convert the state to a float
@@ -393,9 +557,13 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
                 self.idle_lvlmax = 0
                 self.idle_lvlmin = 100
                 self.produced = 0
+
                 for fg in self.fuseGroups:
-                    fg.initPower = True
+                    fg.initCPower = True
+                    fg.initDPower = True
+
                 await self.powerChanged(p1, isFast, time)
+
             except Exception as err:
                 _LOGGER.error(err)
                 _LOGGER.error(traceback.format_exc())
@@ -410,20 +578,26 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
         setpoint = p1
         power = 0
 
-        for d in self.devices:
+        _LOGGER.info(f"Distribution setpoint calculation for {len(self.devices)} devices with setpoint {setpoint}W")
+        for d in sorted(self.devices, key=lambda d: (d.solarInput.asInt, d.pwr_offgrid), reverse=True):
             if await d.power_get():
+                # workaround: no InputPower to the device but some power into the batterie, assume power from grid -> seen in logs from Kieft-C on starting charge
+                # may not updatetd in time from MQTT stream, but will create wrong calculation of produced power
+                #if d.solarInput.asInt == 0 and max(0,d.pwr_offgrid) == 0 and d.homeInput.asInt == 0 and d.batteryInput.asInt > 0:
+                #    d.homeInput.update_value(d.batteryInput.asInt)
                 # get power production
                 d.pwr_produced = min(0, d.batteryOutput.asInt + d.homeInput.asInt - d.batteryInput.asInt - d.homeOutput.asInt)
                 self.produced -= d.pwr_produced
 
-                if (home := -d.homeInput.asInt + d.pwr_offgrid) < 0:
+                # only positive pwr_offgrid must be taken into account, negative values count a solarInput
+                if (home := -d.homeInput.asInt + max(0,d.pwr_offgrid)) < 0:
                     self.charge.append(d)
                     self.charge_limit += d.fuseGrp.charge_limit(d)
                     self.charge_optimal += d.charge_optimal
                     self.charge_weight += d.pwr_max * (100 - d.electricLevel.asInt)
                     setpoint += home
-
-                elif (home := d.homeOutput.asInt) > 0 and d.state != DeviceState.SOCEMPTY:
+                # SOCEMPTY means, it could not discharge the battery, but it is still possible to feed into the home using solarpower or offGrid
+                elif (home := d.homeOutput.asInt) > 0:
                     self.discharge.append(d)
                     self.discharge_bypass -= d.pwr_produced if d.state == DeviceState.SOCFULL else 0
                     self.discharge_limit += d.fuseGrp.discharge_limit(d)
@@ -432,13 +606,21 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
                     self.discharge_weight += d.pwr_max * d.electricLevel.asInt
                     setpoint += home
 
+                # special case: gridOff device with SoC empty get the power from the grid. But if homeOutput is still > 0, this information was
+                # not yet pushed in the MQTT stream. So add the offGrid Power to the setpoint and stop discharging
+                elif (home := d.homeOutput.asInt) > 0 and d.state == DeviceState.SOCEMPTY and max(0,d.pwr_offgrid) > 0:
+                    setpoint += max(0,d.pwr_offgrid)
+                    await d.power_discharge(0)
+
                 else:
                     self.idle.append(d)
-                    self.idle_lvlmax = max(self.idle_lvlmax, d.electricLevel.asInt)
+                    # don't care on SoC for discharge, if there are other devices with production
+                    self.idle_lvlmax = max(self.idle_lvlmax, 0 if d.pwr_produced == 0 and self.produced > 0 else d.electricLevel.asInt)
                     self.idle_lvlmin = min(self.idle_lvlmin, d.electricLevel.asInt if d.state != DeviceState.SOCFULL else 100)
 
                 availableKwh += d.actualKwh
                 power += d.pwr_offgrid + home + d.pwr_produced
+                _LOGGER.info(f"Device: {d.name}\t home: {home}W\tprod: {d.pwr_produced}W\t SoC: {d.electricLevel.asInt}\toffGridPower: {d.pwr_offgrid}\tstate: {d.state.name}\tbatOut: {d.batteryOutput.asInt}\thomeIn: {d.homeInput.asInt} \tbatIn: {d.batteryInput.asInt} \thomeOut: {d.homeOutput.asInt}")
 
         # Update the power entities
         self.power.update_value(power)
@@ -459,9 +641,14 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
                 # Only discharge, do nothing if setpoint is negative
                 await self.power_discharge(max(0, setpoint))
 
-            case ManagerMode.MATCHING_CHARGE:
-                # Only charge, do nothing if setpoint is positive
-                await self.power_charge(min(0, setpoint), time)
+            case ManagerMode.MATCHING_CHARGE | ManagerMode.MATCHING_CHARGE_BAT:
+                # Allow discharge of produced power in MATCHING_CHARGE-Mode, otherwise only charge
+                # d.pwr_produced is negative, but self.produced is positive
+                if setpoint > 0 and self.produced > SmartMode.POWER_START and self.operation == ManagerMode.MATCHING_CHARGE:
+                    await self.power_discharge(min(self.produced, setpoint))
+                else:
+                    # Only charge, do nothing if setpoint is positive
+                    await self.power_charge(min(0, setpoint), time)
 
             case ManagerMode.MANUAL:
                 # Manual power into or from home
@@ -479,23 +666,30 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
 
         # stop discharging devices
         for d in self.discharge:
-            await d.power_discharge(0)
+            # avoid gridOff device to use power from the grid
+            await d.power_discharge(0 if max(0,d.pwr_offgrid) == 0 else -10)
 
         # prevent hysteria
         if self.charge_time > time:
             if self.charge_time == datetime.max:
-                self.charge_time = time + timedelta(seconds=2 if (time - self.charge_last).total_seconds() > 300 else 60)
+                self.charge_time = time + timedelta(seconds=2 if (time - self.charge_last).total_seconds() > 300 else 10) #ehemals 10 war 60
                 self.charge_last = self.charge_time
                 self.pwr_low = 0
             setpoint = 0
         self.operationstate.update_value(ManagerState.CHARGE.value if setpoint < 0 else ManagerState.IDLE.value)
 
         # distribute charging devices
-        dev_start = min(0, setpoint - self.charge_optimal * 2) if setpoint < -SmartMode.POWER_START else 0
+        # take offGrid power into account on deciding to start more devices
+        dev_start = min(0, setpoint - self.charge_optimal * 2 + (sum(max(0,d.pwr_offgrid) for d in self.devices) if len(self.charge) > 0 else 0)) if setpoint < -SmartMode.POWER_START else 0
+        # if gridOff device will be added, reduce power for the other devices
+        if (dev_start < 0 and len(self.idle) > 0):
+            sum_idle_pwr = sum(max(0,di.pwr_offgrid) for di in self.idle)
+        else:
+            sum_idle_pwr = 0
         limit = self.charge_limit
         setpoint = max(limit, setpoint)
         for i, d in enumerate(sorted(self.charge, key=lambda d: d.electricLevel.asInt, reverse=True)):
-            pwr = int(setpoint * (d.pwr_max * (100 - d.electricLevel.asInt)) / self.charge_weight)
+            pwr = int(setpoint * ((d.pwr_max * (100 - d.electricLevel.asInt)) / self.charge_weight) if self.charge_weight != 0 else 0)
             self.charge_weight -= d.pwr_max * (100 - d.electricLevel.asInt)
 
             # adjust the limit, make sure we have 'enough' power to charge
@@ -508,17 +702,23 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
             if len(self.charge) > 1 and i == 0:
                 self.pwr_low = 0 if (delta := d.charge_start * 1.5 - pwr) >= 0 else self.pwr_low + int(-delta)
                 pwr = 0 if self.pwr_low < d.charge_optimal else pwr
-
-            setpoint -= await d.power_charge(pwr)
+            # SF 2400 feed all negative offGridPower into homegrid, if power set to 0
+            # SF 2400 let us control only battery out vs. homeOutput on other devices
+            setpoint -= await d.power_charge(min(0 if d.pwr_offgrid == 0 else -10, max(d.pwr_max,pwr- max(0,d.pwr_offgrid)+ sum_idle_pwr))) + max(0,d.pwr_offgrid)
             dev_start += -1 if pwr != 0 and d.electricLevel.asInt > self.idle_lvlmin + 3 else 0
 
         # start idle device if needed
-        if dev_start < 0 and len(self.idle) > 0:
+        if (dev_start < 0 and len(self.idle) > 0) or (len(self.charge)==0 and self.produced == 0 and setpoint <= -SmartMode.POWER_START) or (setpoint <= -SmartMode.POWER_START and len(self.idle) > 0):
             self.idle.sort(key=lambda d: d.electricLevel.asInt, reverse=False)
             for d in self.idle:
-                await d.power_charge(-SmartMode.POWER_START-d.pwr_offgrid)
-                if (dev_start := dev_start - d.charge_optimal * 2) >= 0:
-                    break
+                # offGrid device need to be started with at least their offgrid power, otherwise they will not be recognized as charging
+                # but should not be started with more than pwr_offgrid if they are full
+                # if a offGrid device need to be started, the output power is set to 0 and it take all offGrid power from grid
+                # also, do not start any devices that are not AC chargeable.
+                if d.charge_limit < 0:
+                    await d.power_charge(-SmartMode.POWER_START - max(0,d.pwr_offgrid) if d.state != DeviceState.SOCFULL else -max(0,d.pwr_offgrid))
+                    if (dev_start := dev_start - d.charge_optimal * 2) >= 0:
+                        break
             self.pwr_low: int = 0
 
     async def power_discharge(self, setpoint: int) -> None:
@@ -533,16 +733,24 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
 
         # stop charging devices
         for d in self.charge:
-            await d.power_discharge(0)
+            # SF 2400 may show more gridInputPower than offGridPower and will be recognized as charging, 
+            # so set power to 10 instead of 0
+            await d.power_discharge(0 if max(0,d.pwr_offgrid) == 0 else 10)
 
-        # distribute discharging devices
-        dev_start = max(0, setpoint - self.discharge_optimal * 2) if setpoint > SmartMode.POWER_START else 0
-        solaronly = self.discharge_produced >= setpoint
-        limit = self.discharge_produced if solaronly else self.discharge_limit
+        # distribute discharging devices, use produced power first, before adding another device
+        dev_start = max(0, setpoint - self.discharge_optimal * 2 - self.discharge_produced) if setpoint > SmartMode.POWER_START else 0
+        # if gridOff device will be added, reduce power for the other devices
+        if (dev_start > 0 and len(self.idle) > 0):
+            sum_idle_pwr = sum(max(0, di.pwr_offgrid) if di.state != DeviceState.SOCEMPTY else 0 for di in self.idle)
+        else:
+            sum_idle_pwr = 0        
+        solaronly = self.produced >= setpoint
+        limit = self.produced if solaronly else self.discharge_limit
         setpoint = min(limit, setpoint)
-        for i, d in enumerate(sorted(self.discharge, key=lambda d: d.electricLevel.asInt, reverse=False)):
+        # first discharge devices with highest solar input and highest SoC
+        for i, d in enumerate(sorted(self.discharge, key=lambda d: (d.solarInput.asInt - min(0,d.pwr_offgrid), d.electricLevel.asInt), reverse=True)):
             # calculate power to discharge
-            if (pwr := int(setpoint * (d.pwr_max * d.electricLevel.asInt) / self.discharge_weight)) < -d.pwr_produced and d.state == DeviceState.SOCFULL:
+            if (pwr := (int(setpoint * (d.pwr_max * d.electricLevel.asInt) / self.discharge_weight)) if self.discharge_weight > 0 else 0) < -d.pwr_produced and d.state == DeviceState.SOCFULL:
                 pwr = -d.pwr_produced
             self.discharge_weight -= d.pwr_max * d.electricLevel.asInt
 
@@ -553,19 +761,28 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
             pwr = min(pwr, setpoint, d.pwr_max)
 
             # make sure we have devices in optimal working range
-            if len(self.discharge) > 1 and i == 0 and d.state != DeviceState.SOCFULL:
-                self.pwr_low = 0 if (delta := d.discharge_start * 1.5 - pwr) <= 0 else self.pwr_low + int(delta)
-                pwr = 0 if self.pwr_low > d.discharge_optimal else pwr
+            if len(self.discharge) > 1 and d.state != DeviceState.SOCFULL and setpoint <= d.discharge_optimal:                
+                # if remaining setpoint < discharge_optimal, use remaining setpoint, this wiil stop following devices
+                pwr = setpoint
 
-            setpoint -= await d.power_discharge(pwr)
+            if solaronly:
+                pwr = min(pwr, -d.pwr_produced)
+
+            # avoid gridOff device to use power from the grid
+            setpoint -= await d.power_discharge(10 if pwr == 0 and max(0,d.pwr_offgrid) > 0 else min(d.discharge_limit,pwr+sum_idle_pwr))
+            # check if we need to start a devices with higher SoC
             dev_start += 1 if pwr != 0 and d.electricLevel.asInt + 3 < self.idle_lvlmax else 0
 
-        # start idle device if needed
-        if dev_start > 0 and len(self.idle) > 0:
-            self.idle.sort(key=lambda d: d.electricLevel.asInt, reverse=True)
-            for d in self.idle:
+        # start idle device if needed (also if setpoint wasn't reached due to solaronly constraints)
+        if (dev_start > 0 or setpoint > SmartMode.POWER_START) and len(self.idle) > 0:
+            # start devices with highest solar input and highest SoC first
+            self.idle.sort(key=lambda d:(d.solarInput.asInt - min(0,d.pwr_offgrid), d.electricLevel.asInt), reverse=True)
+            for d in self.idle:             
+                # switch OFF device, if empty
                 if d.state != DeviceState.SOCEMPTY:
                     await d.power_discharge(SmartMode.POWER_START)
                     if (dev_start := dev_start - d.discharge_optimal * 2) <= 0:
                         break
+                else:
+                    await d.power_discharge(0)
             self.pwr_low: int = 0
