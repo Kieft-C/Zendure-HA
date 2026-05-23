@@ -67,6 +67,9 @@
       },
       "heat_state": {
         "name": "chauffage de batterie"
+      },
+      "rest_state": {
+        "name": "mode d'économie d'énergie"
       }
     },
     "number": {
@@ -84,6 +87,9 @@
       },
       "soc_set": {
         "name": "SOC maximum"
+      },
+      "optimal_power": {
+        "name": "optimal Power (% of max)"
       }
     },
     "sensor": {
@@ -115,6 +121,13 @@
       },
       "aggr_solar_total": {
         "name": "Total solaire"
+      },
+      "plug_state": {
+        "name": "Multiprise hors réseau",
+        "state": {
+          "0": "pas disponible",
+          "1": "connecté"
+        }
       },
       "connection_status": {
         "name": "État de la connexion",
@@ -216,6 +229,9 @@
       "batcur": {
         "name": "Intensité"
       },
+      "bat_in_out": {
+        "name": "Puissance de la batterie"
+      },
       "pack_input_power": {
         "name": "Puissance de sortie de la batterie"
       },
@@ -303,6 +319,13 @@
           "output": "Mode sortie AC"
         }
       },
+      "dc_switch": {
+        "name": "Port CC",
+        "state": {
+          "on": "Arrêt/Sortie",
+          "off": "Marche/Entrée"
+        }
+      },
       "hems_state": {
         "name": "État HEMS",
         "state": {
@@ -344,7 +367,8 @@
           "manual": "Puissance manuelle",
           "smart": "Couplage intelligent",
           "smart_discharging": "Décharge intelligente",
-          "smart_charging": "Charge intelligente"
+          "smart_charging": "Charge intelligente | PV -> Maison",
+          "smart_charging_bat": "Charge intelligente | PV -> Bat"
         }
       },
       "pass_mode": {
@@ -383,6 +407,9 @@
     "switch": {
       "lamp_switch": {
         "name": "LED"
+      },
+      "ac_switch": {
+        "name": "prise secteur"
       },
       "buzzer_switch": {
         "name": "Buzzer"
