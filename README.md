@@ -11,14 +11,14 @@ This Home Assistant integration connects your Zendure devices to Home Assistant,
 ## Overview
 
 - **[Installation and ZendureApp Token](https://github.com/Zendure/Zendure-HA/wiki/Installation)**
-  - [Troubleshooting Hyper2000](https://github.com/Zendure/Zendure-HA/wiki/Troubleshooting) 
+  - [Troubleshooting Hyper2000](https://github.com/Zendure/Zendure-HA/wiki/Troubleshooting)
   - Tutorials
     - [Domotica & IoT](https://iotdomotica.nl/tutorial/install-zendure-home-assistant-integration-tutorial) 🇬🇧
     - [twoenter blog](https://www.twoenter.nl/blog/en/smarthome-en/zendure-home-battery-home-assistant-integration/) 🇬🇧 or [twoenter blog](https://www.twoenter.nl/blog/home-assistant-nl/zendure-thuisaccu-integratie-met-home-assistant/) 🇳🇱
     - [@Kieft-C](https://github.com/Kieft-C/Zendure-BKW-PV/wiki/Installation-Zendure-Home-Assistant-integration-%E2%80%93-Tutorial) 🇩🇪
 
 - **Configuration:**
-  - [Fuse Group](https://github.com/Zendure/Zendure-HA/wiki/Fuse-Group) 
+  - [Fuse Group](https://github.com/Zendure/Zendure-HA/wiki/Fuse-Group)
   - Zendure Manager
     - [Power distribution strategy](https://github.com/Zendure/Zendure-HA/wiki/Power-distribution-strategy)
   - [Local Mqtt (Legacy devices)](https://github.com/Zendure/Zendure-HA/wiki/Local-Mqtt-(Legacy-Devices))
@@ -33,16 +33,55 @@ This Home Assistant integration connects your Zendure devices to Home Assistant,
   - [SF800](https://github.com/Zendure/Zendure-HA/wiki/SolarFlow-800)
   - SF800 Pro
   - SF800 Plus
+  - SF1600 AC+ *added in this 1.2.4 version additonal
   - SF2400 AC
   - SuperBase V6400
 
 - **Device Automation:**
   - Cheap hours.
 
+## Local Modifications (Fork)
+
+This is a local fork of the Zendure Home Assistant integration (based on version 1.2.4) with the following changes. These changes are **not** part of the official release.
+
+### Added: SolarFlow 1600 AC+ support
+
+The SolarFlow 1600 AC+ was not recognized by version 1.2.4. The following changes enable detection:
+
+- **`devices/solarflow1600.py`** (new file): copied from the upstream Zendure-HA repository. It defines the `SolarFlow1600` device class.
+- **`api.py`**: import of `SolarFlow1600` and the mapping `"solarflow 1600 ac+": SolarFlow1600` in `createdevice`.
+- **`manager.py`**: device model lookup now uses `prodModel.strip().lower()`. The cloud reports the model as `SolarFlow 1600 AC+ ` with a trailing space, which caused the device to be skipped as "not supported".
+
+### Fixed: Startup and runtime errors
+
+- **`manager.py`, `update_p1meter`**: returns early when `p1meter is None`. Previously, unloading the integration raised `TypeError: expected string or bytes-like object, got 'NoneType'`.
+- **`entity.py`, entity IDs**: entity IDs are now built with `slugify(self.device.name)` and `_` as separator. This removes the warning `sets an invalid entity ID`. Existing entities keep their registered IDs, because Home Assistant only uses the suggested ID for new entities.
+- **`entity.py`, `updateVersion`**: calls `device_registry.async_update_device` directly instead of `run_callback_threadsafe`. This removes `RuntimeError: Cannot be called from within the event loop` and the version sensor now shows e.g. `v1.1.2` instead of the raw value `4354`.
+
+### Known remaining warnings
+
+These are deprecation warnings from Home Assistant. They do not affect operation, but will stop working in future Home Assistant versions:
+
+- `device_registry.async_get_device` is used in `entity.py` (deprecated, removal planned for 2027.8.0).
+- `via_device` is passed as a parameter in `entity.py` (deprecated, removal planned for 2027.8.0).
+
+### Known limitations
+
+- The SolarFlow 1600 AC+ cloud data does not include an IP address (`ip: ''`). Local control via zenSDK requires a fixed IP address that must be set manually.
+- The power limits for the SolarFlow 1600 AC+ are hardcoded in `devices/solarflow1600.py` (`setLimits(-1600, 1600)`). These values influence the power distribution of the manager.
+- The integration updates are not automatic. Changes need to be re-applied when updating the upstream integration.
+
+## Installation (Fork)
+
+1. Back up the existing `custom_components/zendure_ha` folder.
+2. Copy the changed files into `custom_components/zendure_ha`, or replace the folder with the patched version.
+3. Restart Home Assistant completely.
+4. Check the log for `Adding device` and make sure no `is not supported!` line appears for the SolarFlow 1600 AC+.
+
 ## Minimum Requirements
 - [Home Assistant](https://github.com/home-assistant/core) 2025.5+
 
-## Installation
+## Installation (Official)
 
 ### HACS (Home Assistant Community Store)
 
