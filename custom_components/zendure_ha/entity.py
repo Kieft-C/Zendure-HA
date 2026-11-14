@@ -6,6 +6,7 @@ import asyncio
 import logging
 from typing import Any
 
+from homeassistant.util import slugify
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.device_registry import DeviceInfo
@@ -41,7 +42,7 @@ class EntityZendure(Entity):
             return
         self.device = device
         self._attr_unique_id = f"{self.device.name}-{uniqueid}"
-        self.entity_id = f"{entitytype}.{self.device.name}-{snakecase(uniqueid)}"
+        self.entity_id = f"{entitytype}.{slugify(self.device.name)}_{snakecase(uniqueid)}"
         self._attr_translation_key = snakecase(uniqueid)
         device.entities[uniqueid] = self
 
@@ -80,8 +81,10 @@ class EntityDevice:
         "solarPower6": ("W", "power"),
         "energyPower": ("W"),
         "inverseMaxPower": ("W"),
+        "batteryElectric": ("W", "power"),
         "VoltWakeup": ("V", "voltage"),
         "totalVol": ("V", "voltage", 100),
+        "totalBatteryVolt": ("V", "voltage", 100),
         "maxVol": ("V", "voltage", 100),
         "minVol": ("V", "voltage", 100),
         "batcur": ("template", "{{ value / 10 if (value | int) < 32768 else (value | bitwise_xor(0x8000 | int) - 0x8000 | int) / 10 }}", "A", "current"),
@@ -92,6 +95,15 @@ class EntityDevice:
         "masterSoftVersion": ("version"),
         "masterhaerVersion": ("version"),
         "dspversion": ("version"),
+        "mpptFirmwareVersion": ("version"),
+        "dcFirmwareVersion": ("version"),
+        "acFirmwareVersion": ("version"),
+        "bmsFirmwareVersion": ("version"),
+        "masterFirmwareVersion": ("version"),
+        "dcHardwareVersion": ("version"),
+        "acHardwareVersion": ("version"),
+        "bmsHardwareVersion": ("version"),
+        "masterHardwareVersion": ("version"),
         "socLevel": ("%", "battery"),
         "soh": ("%", None, "{{ (value / 10) }}"),
         "electricLevel": ("%", "battery"),
@@ -102,9 +114,10 @@ class EntityDevice:
         "wifiState": ("binary"),
         "heatState": ("binary"),
         "reverseState": ("binary"),
+        "restState": ("binary"),
         "pass": ("binary"),
         "lowTemperature": ("binary"),
-        "autoHeat": ("select", {0: "off", 1: "on"}),
+        "autoHeat": ("select", {0: "off", 1: "on"},1),
         "localState": ("binary"),
         "ctOff": ("binary"),
         "lampSwitch": ("switch"),
@@ -121,6 +134,8 @@ class EntityDevice:
         "ambientLightMode": ("none"),
         "ambientSwitch": ("none"),
         "PowerCycle": ("none"),
+        "acoutputPowerCycle": ("none"),
+        "dcoutputPowerCycle": ("none"),
         "gridInputPowerCycle": ("none"),
         "packInputPowerCycle": ("none"),
         "outputPackPowerCycle": ("none"),
@@ -231,7 +246,8 @@ class EntityDevice:
                     case "select":
                         if isinstance(info[1], dict):
                             options: Any = info[1]
-                            entity = ZendureSelect(self, key, options, self.entityWrite, 0)
+                            default: Any = 0 if len(info) == 2 else info[2]
+                            entity = ZendureSelect(self, key, options, self.entityWrite, default)
                     case "template":
                         tmpl = Template(info[1], self.hass)
                         entity = ZendureSensor(self, key, tmpl, info[2], info[3], "measurement", None)
@@ -258,4 +274,4 @@ class EntityDevice:
         device_registry = dr.async_get(self.hass)
         device_entry = device_registry.async_get_device(identifiers={(DOMAIN, self.name)})
         if device_entry is not None:
-            run_callback_threadsafe(self.hass.loop, lambda: device_registry.async_update_device(device_entry.id, sw_version=version))
+            device_registry.async_update_device(device_entry.id, sw_version=version)

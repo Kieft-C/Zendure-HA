@@ -104,6 +104,7 @@ class ZendureDevice(EntityDevice):
         self.pwr_produced: int = 0
         self.actualKwh: float = 0.0
         self.state: DeviceState = DeviceState.OFFLINE
+        self.offGridReserve = 0
 
         self.create_entities()
 
@@ -126,12 +127,15 @@ class ZendureDevice(EntityDevice):
         self.batteryInput = ZendureSensor(self, "outputPackPower", None, "W", "power", "measurement")
         self.batteryOutput = ZendureSensor(self, "packInputPower", None, "W", "power", "measurement")
         self.homeOutput = ZendureSensor(self, "outputHomePower", None, "W", "power", "measurement")
+        self.commandedPwr = ZendureSensor(self, "commandedPwr", None, "W", "power", "measurement") #HarryAddition
+        self.heatState = ZendureBinarySensor(self, "heatState")
         self.hemsState = ZendureBinarySensor(self, "hemsState")
         self.hemsStateUpdate = datetime.min
         self.availableKwh = ZendureSensor(self, "available_kwh", None, "kWh", "energy", None, 1)
         self.connectionStatus = ZendureSensor(self, "connectionStatus")
         self.connection: ZendureRestoreSelect
         self.remainingTime = ZendureSensor(self, "remainingTime", None, "h", "duration", "measurement")
+        self.nextCalibration = ZendureRestoreSensor(self, "nextCalibration", None, None, "timestamp", None)
 
         self.aggrCharge = ZendureRestoreSensor(self, "aggrChargeTotal", None, "kWh", "energy", "total_increasing", 2)
         self.aggrDischarge = ZendureRestoreSensor(self, "aggrDischargeTotal", None, "kWh", "energy", "total_increasing", 2)
@@ -139,6 +143,8 @@ class ZendureDevice(EntityDevice):
         self.aggrHomeOut = ZendureRestoreSensor(self, "aggrOutputHomeTotal", None, "kWh", "energy", "total_increasing", 2)
         self.aggrSolar = ZendureRestoreSensor(self, "aggrSolarTotal", None, "kWh", "energy", "total_increasing", 2)
         self.aggrSwitchCount = ZendureRestoreSensor(self, "switchCount", None, None, None, "total_increasing", 0)
+        self.batInOut = ZendureSensor(self, "batInOut", None, "W", "power", "measurement")
+
 
     def setLimits(self, charge: int, discharge: int) -> None:
         try:
@@ -154,7 +160,7 @@ class ZendureDevice(EntityDevice):
             self.limitOutput.update_range(0, discharge)
         except Exception:
             _LOGGER.error(f"SetLimits error {self.name} {charge} {discharge}!")
-
+            
     def setStatus(self) -> None:
         from .api import Api
 
@@ -190,16 +196,20 @@ class ZendureDevice(EntityDevice):
                         if value == 0:
                             self.aggrSwitchCount.update_value(1 + self.aggrSwitchCount.asNumber)
                     case "outputPackPower":
-                        self.aggrCharge.aggregate(dt_util.now(), value)
+                        if not self.heatState.is_on:
+                            self.aggrCharge.aggregate(dt_util.now(), value)
                         self.aggrDischarge.aggregate(dt_util.now(), 0)
+                        self.batInOut.update_value(self.batteryOutput.asInt - self.batteryInput.asInt)
                     case "packInputPower":
                         self.aggrCharge.aggregate(dt_util.now(), 0)
                         self.aggrDischarge.aggregate(dt_util.now(), value)
+                        self.batInOut.update_value(self.batteryOutput.asInt - self.batteryInput.asInt)
                     case "solarInputPower":
                         self.aggrSolar.aggregate(dt_util.now(), value)
                     case "gridInputPower":
                         self.aggrHomeInput.aggregate(dt_util.now(), value)
-                    case "outputHomePower":
+                        _LOGGER.info(f"value for gridInputPower {self.homeInput.asInt}W as float {self.homeInput.asNumber}W")
+                    case "outputHomePower" | "acOutputPower":
                         self.aggrHomeOut.aggregate(dt_util.now(), value)
                     case "gridOffPower":
                         self.aggrOffGrid.aggregate(dt_util.now(), value)
@@ -209,8 +219,12 @@ class ZendureDevice(EntityDevice):
                         self.setLimits(-value, self.discharge_limit)
                     case "hemsState" | "socStatus":
                         self.setStatus()
+                        if key == "socStatus" and self.socStatus.asInt == 0:
+                            self.nextCalibration.update_value(dt_util.now() + timedelta(days=30))
                     case "electricLevel" | "minSoc" | "socLimit":
-                        self.availableKwh.update_value((self.electricLevel.asNumber - self.minSoc.asNumber) / 100 * self.kWh)
+                        if self.electricLevel.asInt == 100:
+                            self.nextCalibration.update_value(dt_util.now() + timedelta(days=30))
+                        self.availableKwh.update_value((self.electricLevel.asNumber - max(self.soc_reserve, self.minSoc.asNumber)) / 100 * self.kWh)
         except Exception as e:
             _LOGGER.error(f"EntityUpdate error {self.name} {key} {e}!")
             _LOGGER.error(traceback.format_exc())
@@ -229,7 +243,7 @@ class ZendureDevice(EntityDevice):
             soc = self.socSet.asNumber
             return 0 if level >= soc else min(999, self.kWh * 10 / -power * (soc - level))
 
-        soc = self.minSoc.asNumber
+        soc = max(self.soc_reserve, self.minSoc.asNumber)
         return 0 if level <= soc else min(999, self.kWh * 10 / power * (level - soc))
 
     async def entityWrite(self, entity: EntityZendure, value: Any) -> None:
@@ -293,7 +307,7 @@ class ZendureDevice(EntityDevice):
                 if (bat := self.batteries.get(sn, None)) is None:
                     self.batteries[sn] = ZendureBattery(self.hass, sn, self)
                     self.kWh = sum(0 if b is None else b.kWh for b in self.batteries.values())
-                    self.availableKwh.update_value((self.electricLevel.asNumber - self.minSoc.asNumber) / 100 * self.kWh)
+                    self.availableKwh.update_value((self.electricLevel.asNumber - max(self.soc_reserve, self.minSoc.asNumber)) / 100 * self.kWh)
 
                 elif bat and b:
                     for key, value in b.items():
@@ -454,7 +468,7 @@ class ZendureDevice(EntityDevice):
             self.state = DeviceState.OFFLINE
         elif self.socLimit.asInt == SmartMode.SOCFULL or self.electricLevel.asInt >= self.socSet.asNumber:
             self.state = DeviceState.SOCFULL
-        elif self.socLimit.asInt == SmartMode.SOCEMPTY or self.electricLevel.asInt <= self.minSoc.asNumber:
+        elif self.socLimit.asInt == SmartMode.SOCEMPTY or self.electricLevel.asInt <= max(self.soc_reserve, self.minSoc.asNumber):
             self.state = DeviceState.SOCEMPTY
         else:
             self.state = DeviceState.INACTIVE
@@ -468,6 +482,7 @@ class ZendureDevice(EntityDevice):
     async def power_charge(self, power: int) -> int:
         """Set charge power."""
         power = min(0, max(power, self.charge_limit))
+        self.commandedPwr.update_value(abs(power))
         if abs(power - self.homeInput.asInt + self.homeOutput.asInt) <= SmartMode.POWER_TOLERANCE:
             _LOGGER.info(f"Power charge {self.name} => no action [power {power}]")
             return self.homeInput.asInt
@@ -480,6 +495,7 @@ class ZendureDevice(EntityDevice):
     async def power_discharge(self, power: int) -> int:
         """Set discharge power."""
         power = max(0, min(power, self.discharge_limit))
+        self.commandedPwr.update_value(abs(power))
         if abs(power - self.homeOutput.asInt + self.homeInput.asInt) <= SmartMode.POWER_TOLERANCE:
             _LOGGER.info(f"Power discharge {self.name} => no action [power {power}]")
             return self.homeOutput.asInt
@@ -487,6 +503,7 @@ class ZendureDevice(EntityDevice):
 
     async def power_off(self) -> None:
         """Set the power off."""
+        self.commandedPwr.update_value(0)
 
     @property
     def online(self) -> bool:
@@ -498,7 +515,11 @@ class ZendureDevice(EntityDevice):
         """Get the offgrid power."""
         return 0
 
-
+    @property
+    def soc_reserve(self) -> int:
+        """Get soc for the reserve."""
+        return 0
+        
 class ZendureLegacy(ZendureDevice):
     """Zendure Legacy class for devices."""
 
@@ -587,12 +608,12 @@ class ZendureZenSdk(ZendureDevice):
     async def charge(self, power: int, _off: bool = False) -> int:
         """Set charge power."""
         _LOGGER.info(f"Power charge {self.name} => {power}")
-        await self.doCommand({"properties": {"smartMode": 0 if power == 0 else 1, "acMode": 1, "inputLimit": -power}})
+        await self.doCommand({"properties": {"smartMode": 0 if power == 0 else 1, "acMode": 1, "outputLimit": 0, "inputLimit": -power}})
         return power
 
     async def discharge(self, power: int) -> int:
         _LOGGER.info(f"Power discharge {self.name} => {power}")
-        await self.doCommand({"properties": {"smartMode": 0 if power == 0 else 1, "acMode": 2, "outputLimit": power}})
+        await self.doCommand({"properties": {"smartMode": 0 if power == 0 else 1, "acMode": 2, "outputLimit": power, "inputLimit": 0}})
         return power
 
     async def power_off(self) -> None:

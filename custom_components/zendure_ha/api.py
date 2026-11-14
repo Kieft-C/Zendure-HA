@@ -39,6 +39,7 @@ from .devices.hub2000 import Hub2000
 from .devices.hyper2000 import Hyper2000
 from .devices.solarflow800 import SolarFlow800
 from .devices.solarflow800Plus import SolarFlow800Plus
+from .devices.solarflow1600 import SolarFlow1600
 from .devices.solarflow800Pro import SolarFlow800Pro
 from .devices.solarflow2400ac import SolarFlow2400AC
 from .devices.superbasev4600 import SuperBaseV4600
@@ -66,6 +67,7 @@ class Api:
         "solarflow 800": SolarFlow800,
         "solarflow 800 pro": SolarFlow800Pro,
         "solarflow 800 plus": SolarFlow800Plus,
+        "solarflow 1600 ac+": SolarFlow1600,
         "solarflow 2400 ac": SolarFlow2400AC,
         "superbase v6400": SuperBaseV6400,
         "superbase v4600": SuperBaseV4600,
@@ -173,6 +175,14 @@ class Api:
 
             result = await session.post(url=f"{api_url}/api/ha/deviceList", json=body, headers=headers)
             data = await result.json()
+            if data.get("code") != 200:
+                _LOGGER.debug(f"Zendure API response: {data.get('code')} Message: {data.get('msg')}")
+            elif data.get("code") == 200 and len(data["data"]["deviceList"]) == 0:
+                _LOGGER.error(f"Zendure API does not reply any devices: {data}")
+                return None
+            elif data.get("code") == 200 and len(data["data"]["mqtt"]) == 0:
+                _LOGGER.error(f"Zendure API does not reply any mqtt info: {data}")
+                return None
             if not data.get("success", False) or (json := data["data"]) is None:
                 return None
             return dict(json)
