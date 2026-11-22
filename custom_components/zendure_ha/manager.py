@@ -115,7 +115,7 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
                     continue
                 _LOGGER.info(f"Adding device: {deviceId} {prodModel} => {dev}")
 
-                init = Api.createdevice.get(prodModel.lower(), None)
+                init = Api.createdevice.get(prodModel.strip().lower(), None)
                 if init is None:
                     _LOGGER.info(f"Device {prodModel} is not supported!")
                     continue
@@ -333,6 +333,10 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
     async def update_p1meter(self, p1meter: str | None) -> None:
         """Update the P1 meter sensor."""
         _LOGGER.debug("Updating P1 meter to: %s", p1meter)
+
+        # Beim Entladen der Integration wird None übergeben: nichts zu tun
+        if p1meter is None:
+            return
 
         interval = SmartMode.P1_HTTP_UPDATE
 

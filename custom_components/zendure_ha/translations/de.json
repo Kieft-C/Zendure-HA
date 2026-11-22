@@ -382,8 +382,8 @@
         "name": "Bypass-Modus",
         "state": {
           "auto": "Automatisch",
-          "off": "Immer aus",
-          "on": "Immer an"
+          "forbidden": "Verboten",
+          "allow": "Erlaubt"
         }
       },
       "grid_off_mode": {
@@ -397,9 +397,9 @@
       "grid_reverse": {
         "name": "Energie Export",
         "state": {
-          "disabled": "Deaktiviert",
-          "allow": "Erlaubt",
-          "forbidden": "Verboten"
+          "auto": "Automatisch",
+          "forbidden": "Verboten",
+          "allow": "Erlaubt"
         }
       },
       "fanspeed": {
