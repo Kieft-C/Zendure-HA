@@ -12,6 +12,7 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity import Entity, EntityPlatformState
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.template import Template
+from homeassistant.util import slugify
 from stringcase import snakecase
 
 from .const import DOMAIN
@@ -62,7 +63,10 @@ class EntityZendure(Entity):
             return
         self.device = device
         self._attr_unique_id = f"{self.device.name}-{uniqueid}"
-        self.entity_id = f"{entitytype}.{self.device.name}-{snakecase(uniqueid)}"
+        # Suggested entity_id must be valid (lowercase, no spaces). HA slugified the old
+        # invalid suggestion itself, so this yields the same IDs as before; entities that
+        # already exist keep their registered entity_id anyway.
+        self.entity_id = f"{entitytype}.{slugify(f'{self.device.name}_{snakecase(uniqueid)}')}"
         self._attr_translation_key = snakecase(uniqueid)
         device.entities[uniqueid] = self
 
