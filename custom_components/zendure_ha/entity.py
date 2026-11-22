@@ -6,13 +6,12 @@ import asyncio
 import logging
 from typing import Any
 
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity import Entity, EntityPlatformState
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.template import Template
-from homeassistant.util.async_ import run_callback_threadsafe
 from stringcase import snakecase
 
 from .const import DOMAIN
@@ -20,6 +19,28 @@ from .const import DOMAIN
 _LOGGER = logging.getLogger(__name__)
 
 CONST_FACTOR = 2
+
+# Home Assistant 2026.8 scoped device identifiers to their config entry:
+# - DeviceRegistry.async_get_device() is deprecated (removed in 2027.8)
+# - DeviceInfo["via_device"] is deprecated in favour of "via_device_id" (removed in 2027.8)
+# Older Home Assistant versions do not know the new API, so keep the old behaviour there.
+_SCOPED_DEVICE_REGISTRY = hasattr(dr.DeviceRegistry, "async_get_device_by_identifier")
+
+
+def _config_entry_id(hass: HomeAssistant) -> str | None:
+    """Return the id of the (single) Zendure config entry."""
+    entries = hass.config_entries.async_entries(DOMAIN, include_ignore=False)
+    return entries[0].entry_id if entries else None
+
+
+def _get_registry_device(hass: HomeAssistant, registry: dr.DeviceRegistry, name: str) -> dr.DeviceEntry | None:
+    """Look up a Zendure device in the device registry by its identifier."""
+    identifier = (DOMAIN, name)
+    if not _SCOPED_DEVICE_REGISTRY:
+        return registry.async_get_device(identifiers={identifier})
+    if (entry_id := _config_entry_id(hass)) is None:
+        return None
+    return registry.async_get_device_by_identifier(identifier, entry_id)
 
 
 class EntityZendure(Entity):
@@ -162,12 +183,27 @@ class EntityDevice:
             model=model,
         )
         device_registry = dr.async_get(self.hass)
-        if di := device_registry.async_get_device(identifiers={(DOMAIN, self.name)}):
+        if di := _get_registry_device(self.hass, device_registry, self.name):
             self.attr_device_info["connections"] = di.connections
             self.attr_device_info["sw_version"] = di.sw_version
 
-        if parent is not None:
+        self._zendure_parent = parent if parent != self.name else None
+        self.link_via_device(device_registry)
+
+    def link_via_device(self, device_registry: dr.DeviceRegistry | None = None) -> None:
+        """Link this device to its parent device (e.g. a battery to its hub)."""
+        if (parent := getattr(self, "_zendure_parent", None)) is None:
+            return
+        if not _SCOPED_DEVICE_REGISTRY:
             self.attr_device_info["via_device"] = (DOMAIN, parent)
+            return
+        if self.attr_device_info.get("via_device_id"):
+            return
+        # via_device_id must reference an already registered device; if the parent
+        # is not registered yet, this is retried right before the entities are added.
+        registry = device_registry or dr.async_get(self.hass)
+        if (parent_device := _get_registry_device(self.hass, registry, parent)) is not None:
+            self.attr_device_info["via_device_id"] = parent_device.id
 
     def add_entity(self, add: AddEntitiesCallback, entity: EntityZendure) -> None:
         toadd: list[EntityZendure] = self.to_add.get(add, [])
@@ -179,6 +215,8 @@ class EntityDevice:
         async def doAddEntities(platforms: dict[AddEntitiesCallback, list[EntityZendure]]) -> None:
             items = list(platforms.items())
             for add, entities in items:
+                for device in {id(d): d for ent in entities if (d := getattr(ent, "device", None)) is not None}.values():
+                    device.link_via_device()
                 add(entities)
                 # Wait a short time before entities are added
                 all_entities_added = False
@@ -270,7 +308,13 @@ class EntityDevice:
 
     def updateVersion(self, version: str) -> None:
         _LOGGER.info(f"Updating {self.name} software version from {self.attr_device_info.get('sw_version')} to {version}")
-        device_registry = dr.async_get(self.hass)
-        device_entry = device_registry.async_get_device(identifiers={(DOMAIN, self.name)})
-        if device_entry is not None:
-            run_callback_threadsafe(self.hass.loop, lambda: device_registry.async_update_device(device_entry.id, sw_version=version))
+
+        @callback
+        def _update_sw_version() -> None:
+            device_registry = dr.async_get(self.hass)
+            if (device_entry := _get_registry_device(self.hass, device_registry, self.name)) is not None:
+                device_registry.async_update_device(device_entry.id, sw_version=version)
+
+        # Called from the MQTT thread (cloud/local MQTT) as well as from the event loop
+        # (zenSDK HTTP polling); call_soon_threadsafe works from both.
+        self.hass.loop.call_soon_threadsafe(_update_sw_version)
