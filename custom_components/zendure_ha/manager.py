@@ -765,7 +765,7 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
             pwr = min(pwr, setpoint, d.pwr_max)
 
             # make sure we have devices in optimal working range
-            if len(self.discharge) > 1 and d.state != DeviceState.SOCFULL and setpoint <= d.discharge_optimal:                
+            if len(self.discharge) > 1 and setpoint <= d.discharge_optimal:                
                 # if remaining setpoint < discharge_optimal, use remaining setpoint, this wiil stop following devices
                 pwr = setpoint
 
